@@ -4,6 +4,8 @@
 #include <iostream>
 #include <vector>
 #include <string>
+#include <algorithm>
+#include <fstream>
 
 using namespace cv;
 using namespace cv::dnn;
@@ -12,6 +14,10 @@ using namespace std;
 class CPUDetector : public GenericDetector {
 private:
     Net net;
+    vector<string> classes;
+    
+    // Changed from static constexpr to static const
+    static const char* const labels[80];
 
 public:
     CPUDetector(const string& modelPath, const vector<string>& targetClasses_)
@@ -54,84 +60,96 @@ public:
         cout << "Image resized and letterboxed: " << resized_img.cols << "x" << resized_img.rows << endl;
 #endif
 
-        DetectionOutput output = runInference(resized_img);
+        // Direct OpenCV DNN processing for CPU
+        Mat blob = blobFromImage(resized_img, 1/255.0, Size(width, height), Scalar(0,0,0), true, false);
+        net.setInput(blob);
+        
+        vector<Mat> outs;
+        net.forward(outs, net.getUnconnectedOutLayersNames());
+        
 #ifdef DEBUG
-        cout << "Inference completed. Outputs: " << output.num_outputs << endl;
-        for (int i = 0; i < output.num_outputs; i++) {
-            if (!output.buffers[i]) {
-                cerr << "Error: Output buffer " << i << " is null!" << endl;
+        cout << "Inference completed. Outputs: " << outs.size() << endl;
+        for (size_t i = 0; i < outs.size(); i++) {
+            cout << "Output " << i << " shape: " << outs[i].size() << endl;
+        }
+#endif
+
+        // Process detections directly using OpenCV instead of the post_process function
+        vector<Rect> boxes;
+        vector<float> confidences;
+        vector<int> classIds;
+        
+        // Process outputs
+        for (size_t i = 0; i < outs.size(); ++i) {
+            // For YOLOv7, we need to process the detection outputs
+            float* data = (float*)outs[i].data;
+            for (int j = 0; j < outs[i].rows; ++j) {
+                Mat scores = outs[i].row(j).colRange(5, outs[i].cols);
+                Point classIdPoint;
+                double confidence;
+                // Get the value and location of the maximum score
+                minMaxLoc(scores, 0, &confidence, 0, &classIdPoint);
+                
+                if (confidence > BOX_THRESH) {
+                    int centerX = (int)(data[j * outs[i].cols + 0] * frame.cols);
+                    int centerY = (int)(data[j * outs[i].cols + 1] * frame.rows);
+                    int width = (int)(data[j * outs[i].cols + 2] * frame.cols);
+                    int height = (int)(data[j * outs[i].cols + 3] * frame.rows);
+                    int left = centerX - width / 2;
+                    int top = centerY - height / 2;
+                    
+                    classIds.push_back(classIdPoint.x);
+                    confidences.push_back((float)confidence);
+                    boxes.push_back(Rect(left, top, width, height));
+                }
             }
         }
-#endif
-
-        detect_result_group_t detect_result_group;
-        // Explicitly call the float version of post_process
-        post_process(
-            static_cast<float*>(output.buffers[0]),
-            static_cast<float*>(output.buffers[1]),
-            static_cast<float*>(output.buffers[2]),
-            height, width,
-            BOX_THRESH, NMS_THRESH,
-            scale, scale,
-            output.zps, output.scales,
-            &detect_result_group,
-            false  // is_quantized = false for CPU
-        );
-
+        
+        // Apply non-maximum suppression
+        vector<int> indices;
+        NMSBoxes(boxes, confidences, BOX_THRESH, NMS_THRESH, indices);
+        
 #ifdef DEBUG
-        cout << "Post-processing done. Found " << detect_result_group.count << " detections" << endl;
-        for (int i = 0; i < detect_result_group.count; i++) {
-            detect_result_t* det = &detect_result_group.results[i];
-            cout << "Detection " << i << ": " << det->name << " (" 
-                 << det->box.left << "," << det->box.top << ")-(" 
-                 << det->box.right << "," << det->box.bottom << "), conf=" 
-                 << det->prop << endl;
-        }
+        cout << "Post-processing done. Found " << indices.size() << " detections" << endl;
 #endif
-
-        for (int i = 0; i < detect_result_group.count; i++) {
-            detect_result_t* det_result = &detect_result_group.results[i];
-
+        
+        // Draw bounding boxes and labels
+        for (size_t i = 0; i < indices.size(); ++i) {
+            int idx = indices[i];
+            Rect box = boxes[idx];
+            int classId = classIds[idx];
+            
+            // Filter by target classes if specified
             if (!targetClasses.empty()) {
                 bool isTarget = false;
                 for (const auto& target : targetClasses) {
-                    if (strcmp(det_result->name, target.c_str()) == 0) {
+                    // Use classId as index to get class name from static labels array
+                    const char* className = classId < 80 ? labels[classId] : "unknown";
+                    if (target == className) {
                         isTarget = true;
                         break;
                     }
                 }
                 if (!isTarget) continue;
             }
-
-            int x1 = static_cast<int>((det_result->box.left - dx) / scale);
-            int y1 = static_cast<int>((det_result->box.top - dy) / scale);
-            int x2 = static_cast<int>((det_result->box.right - dx) / scale);
-            int y2 = static_cast<int>((det_result->box.bottom - dy) / scale);
-
-            x1 = max(0, min(x1, img_width - 1));
-            y1 = max(0, min(y1, img_height - 1));
-            x2 = max(0, min(x2, img_width - 1));
-            y2 = max(0, min(y2, img_height - 1));
-#ifdef DEBUG
-            cout << "Drawing box: (" << x1 << "," << y1 << ")-(" << x2 << "," << y2 << ")" << endl;
-#endif
-
-            rectangle(frame, Point(x1, y1), Point(x2, y2), Scalar(0, 255, 0), 2);
-
-            char text[256];
-            sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
-            int baseLine = 0;
-            Size label_size = getTextSize(text, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
-            int x = x1;
-            int y = y1 - label_size.height - baseLine;
-            if (y < 0) y = y1 + label_size.height;
-            if (x + label_size.width > frame.cols) x = frame.cols - label_size.width;
-
-            rectangle(frame, Rect(Point(x, y), Size(label_size.width, label_size.height + baseLine)),
-                      Scalar(255, 255, 255), -1);
-            putText(frame, text, Point(x, y + label_size.height), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
+            
+            // Draw bounding box
+            rectangle(frame, box, Scalar(0, 255, 0), 2);
+            
+            // Get class name and confidence
+            string className = (classId < 80) ? labels[classId] : "unknown";
+            string label = className + ": " + to_string(int(confidences[idx] * 100)) + "%";
+            
+            // Draw label background
+            int baseLine;
+            Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+            rectangle(frame, Point(box.x, box.y - labelSize.height - baseLine),
+                      Point(box.x + labelSize.width, box.y), Scalar(255, 255, 255), FILLED);
+            
+            // Draw label text
+            putText(frame, label, Point(box.x, box.y - baseLine), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
         }
+        
 #ifdef DEBUG
         cout << "Frame processing completed." << endl;
 #endif
@@ -144,8 +162,22 @@ protected:
 #endif
         string cfg = modelPath + "/yolov7-tiny.cfg";
         string weights = modelPath + "/yolov7-tiny.weights";
+        
+        // Load COCO class names
+        string namesFile = modelPath + "/coco.names";
+        ifstream ifs(namesFile);
+        if (!ifs.is_open()) {
+            cerr << "Error opening names file: " << namesFile << endl;
+            throw runtime_error("Failed to load class names");
+        }
+        string line;
+        while (getline(ifs, line)) {
+            classes.push_back(line);
+        }
+        
 #ifdef DEBUG
         cout << "Loading model: cfg=" << cfg << ", weights=" << weights << endl;
+        cout << "Loaded " << classes.size() << " class names" << endl;
 #endif
         net = readNet(cfg, weights);
         net.setPreferableBackend(DNN_BACKEND_OPENCV);
@@ -173,48 +205,9 @@ protected:
     }
 
     DetectionOutput runInference(const Mat& input) override {
-#ifdef DEBUG
-        cout << "Running inference on input: " << input.cols << "x" << input.rows << endl;
-#endif
-        Mat blob = blobFromImage(input, 1.0 / 255.0, Size(width, height), Scalar(0, 0, 0), true, false);
-#ifdef DEBUG
-        cout << "Blob created: " << blob.cols << "x" << blob.rows << "x" << blob.channels() << endl;
-#endif
-        net.setInput(blob);
-#ifdef DEBUG
-        cout << "Input set to network." << endl;
-#endif
-
-        vector<Mat> outs;
-        vector<String> outNames = net.getUnconnectedOutLayersNames();
-#ifdef DEBUG
-        cout << "Output layer names: ";
-        for (const auto& name : outNames) cout << name << " ";
-        cout << endl;
-#endif
-        net.forward(outs, outNames);
-#ifdef DEBUG
-        cout << "Inference completed. Number of outputs: " << outs.size() << endl;
-        for (size_t i = 0; i < outs.size(); i++) {
-            cout << "Output " << i << ": " << outs[i].cols << "x" << outs[i].rows << endl;
-        }
-#endif
-
+        // This is not used in the overridden detect() method but must be implemented for the abstract class
         DetectionOutput output;
-        output.buffers.resize(outs.size());
-        output.num_outputs = outs.size();
-        for (size_t i = 0; i < outs.size(); i++) {
-            output.buffers[i] = outs[i].data;  // Float output assumed
-#ifdef DEBUG
-            cout << "Output " << i << " buffer assigned, size=" << outs[i].total() * outs[i].elemSize() << " bytes" << endl;
-#endif
-        }
-        output.scales = vector<float>(outs.size(), 1.0);  // No quantization
-        output.zps = vector<int32_t>(outs.size(), 0);     // No quantization
-#ifdef DEBUG
-        cout << "DetectionOutput prepared: " << output.num_outputs << " outputs, scales and zps set." << endl;
-#endif
-
+        output.num_outputs = 0;
         return output;
     }
 
@@ -223,6 +216,19 @@ protected:
         cout << "Destroying CPUDetector..." << endl;
 #endif
     }
+};
+
+// Define the static array outside the class
+const char* const CPUDetector::labels[80] = {
+    "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat", "traffic light",
+    "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat", "dog", "horse", "sheep", "cow",
+    "elephant", "bear", "zebra", "giraffe", "backpack", "umbrella", "handbag", "tie", "suitcase", "frisbee",
+    "skis", "snowboard", "sports ball", "kite", "baseball bat", "baseball glove", "skateboard", "surfboard",
+    "tennis racket", "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+    "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair", "couch",
+    "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse", "remote", "keyboard", "cell phone",
+    "microwave", "oven", "toaster", "sink", "refrigerator", "book", "clock", "vase", "scissors", "teddy bear",
+    "hair drier", "toothbrush"
 };
 
 Detector* createDetector(const string& modelPath, const vector<string>& targetClasses) {

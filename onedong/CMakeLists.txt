@@ -6,7 +6,10 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 # Find OpenCV
 find_package(OpenCV REQUIRED)
-include_directories(${OpenCV_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/include)
+# Find CURL
+find_package(CURL REQUIRED)
+
+include_directories(${OpenCV_INCLUDE_DIRS} ${CURL_INCLUDE_DIRS} ${CMAKE_SOURCE_DIR}/include)
 
 # Options for platform support
 option(USE_CUDA "Enable CUDA support for Jetson" OFF)
@@ -59,10 +62,15 @@ add_executable(object_detection
 )
 
 # Link libraries
-target_link_libraries(object_detection PRIVATE ${OpenCV_LIBS})
+target_link_libraries(object_detection PRIVATE 
+    ${OpenCV_LIBS}
+    ${CURL_LIBRARIES}
+)
+
 if(USE_CUDA)
     target_link_libraries(object_detection PRIVATE ${CUDA_LIBRARIES} cudart)
 endif()
+
 if(USE_RKNN)
     target_link_libraries(object_detection PRIVATE ${RKNN_API_LIBRARY})
 endif()
@@ -75,6 +83,7 @@ set_target_properties(object_detection PROPERTIES
 # Print configuration status
 message(STATUS "Building ObjectDetection with:")
 message(STATUS "  - OpenCV: ${OpenCV_VERSION}")
+message(STATUS "  - CURL: ${CURL_VERSION_STRING}")
 message(STATUS "  - USE_CUDA: ${USE_CUDA}")
 message(STATUS "  - USE_RKNN: ${USE_RKNN}")
 message(STATUS "  - Platform source: ${PLATFORM_SOURCE}")

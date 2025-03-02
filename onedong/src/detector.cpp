@@ -82,6 +82,7 @@ void GenericDetector::detect(Mat& frame) {
     }
 #endif
 
+    detections.clear();
     for (int i = 0; i < detect_result_group.count; i++) {
         detect_result_t* det_result = &detect_result_group.results[i];
 
@@ -109,25 +110,44 @@ void GenericDetector::detect(Mat& frame) {
         cout << "Drawing box: (" << x1 << "," << y1 << ")-(" << x2 << "," << y2 << ")" << endl;
 #endif
 
+        // Save detection for tracker
+        Detection det;
+        det.classId = string(det_result->name);
+        det.confidence = det_result->prop;
+        det.box = Rect(x1, y1, x2-x1, y2-y1);
+        detections.push_back(det);
+
+        // Draw the box
         rectangle(frame, Point(x1, y1), Point(x2, y2), Scalar(0, 255, 0), 2);
 
+        // Fixed label drawing code
         char text[256];
         sprintf(text, "%s %.1f%%", det_result->name, det_result->prop * 100);
+        
         int baseLine = 0;
         Size label_size = getTextSize(text, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
-
-        int x = x1;
+        
         int y = y1 - label_size.height - baseLine;
         if (y < 0) y = y1 + label_size.height;
-        if (x + label_size.width > frame.cols) x = frame.cols - label_size.width;
-
-        rectangle(frame, Rect(Point(x, y), Size(label_size.width, label_size.height + baseLine)),
+        
+        int x = x1;
+        if (x + label_size.width > frame.cols)
+            x = frame.cols - label_size.width;
+        
+        rectangle(frame, Point(x, y - label_size.height - baseLine),
+                  Point(x + label_size.width, y + baseLine),
                   Scalar(255, 255, 255), -1);
-        putText(frame, text, Point(x, y + label_size.height), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
+        putText(frame, text, Point(x, y), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
     }
-#ifdef DEBUG
-    cout << "Frame processing completed." << endl;
-#endif
 
-    releaseOutputs(output);  // Call platform-specific cleanup
+    // Release buffers if needed
+    releaseOutputs(output);
+    
+#ifdef DEBUG
+    cout << "Frame processing completed with " << detections.size() << " relevant detections." << endl;
+#endif
+}
+
+const std::vector<Detection>& GenericDetector::getDetections() const {
+    return detections;
 }
