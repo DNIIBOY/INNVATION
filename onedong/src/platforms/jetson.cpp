@@ -1,6 +1,9 @@
 #include "detector.h"
 #include <opencv2/dnn.hpp>
+#include <opencv2/cudawarping.hpp>  // For cuda::resize
+#include <opencv2/cudaimgproc.hpp>  // For cuda::cvtColor
 #include <iostream>
+#include <fstream>
 #include <vector>
 #include <string>
 
@@ -8,9 +11,21 @@ using namespace cv;
 using namespace cv::dnn;
 using namespace std;
 
+#ifndef BOX_THRESH
+#define BOX_THRESH 0.25
+#endif
+#ifndef NMS_THRESH
+#define NMS_THRESH 0.45
+#endif
+
 class JetsonDetector : public GenericDetector {
 private:
     Net net;
+    vector<string> classNames;
+
+    void preprocessFrame(const Mat& frame, Mat& blob);
+    void runInferenceGPU(const Mat& blob, vector<Mat>& outs);
+    void postprocessDetections(const vector<Mat>& outs, Mat& frame, float scale, int dx, int dy);
 
 public:
     JetsonDetector(const string& modelPath, const vector<string>& targetClasses_)
@@ -18,103 +33,223 @@ public:
         initialize(modelPath);
     }
 
+    void detect(Mat& frame) override {
+        if (!initialized) {
+            cerr << "Error: Detector not properly initialized" << endl;
+            return;
+        }
+#ifdef DEBUG
+        cout << "Detecting on frame: " << frame.cols << "x" << frame.rows << endl;
+#endif
+
+        Mat blob;
+        preprocessFrame(frame, blob);
+
+        vector<Mat> outs;
+        runInferenceGPU(blob, outs);
+
+        int img_width = frame.cols;
+        int img_height = frame.rows;
+        float scale = min(static_cast<float>(width) / img_width, static_cast<float>(height) / img_height);
+        int new_width = static_cast<int>(img_width * scale);
+        int new_height = static_cast<int>(img_height * scale);
+        int dx = (width - new_width) / 2;
+        int dy = (height - new_height) / 2;
+
+        postprocessDetections(outs, frame, scale, dx, dy);
+#ifdef DEBUG
+        cout << "Detected " << detections.size() << " objects" << endl;
+#endif
+    }
+
 protected:
     void initialize(const string& modelPath) override {
 #ifdef DEBUG
         cout << "Initializing JetsonDetector with modelPath: " << modelPath << endl;
 #endif
+        string namesFile = modelPath + "/coco.names";
+        ifstream ifs(namesFile);
+        if (!ifs.is_open()) {
+            cerr << "Error: Could not open " << namesFile << endl;
+            throw runtime_error("Failed to load class names");
+        }
+        string line;
+        while (getline(ifs, line)) {
+            if (!line.empty()) classNames.push_back(line);
+        }
+        ifs.close();
+#ifdef DEBUG
+        cout << "Loaded " << classNames.size() << " class names" << endl;
+#endif
+
         string cfg = modelPath + "/yolov7-tiny.cfg";
         string weights = modelPath + "/yolov7-tiny.weights";
-#ifdef DEBUG
-        cout << "Loading model: cfg=" << cfg << ", weights=" << weights << endl;
-#endif
         net = readNet(cfg, weights);
 #ifdef USE_CUDA
         net.setPreferableBackend(DNN_BACKEND_CUDA);
-        net.setPreferableTarget(DNN_TARGET_CUDA);
+        net.setPreferableTarget(DNN_TARGET_CUDA_FP16);
 #ifdef DEBUG
-        cout << "Using CUDA backend and target for Jetson." << endl;
+        cout << "Using CUDA backend and FP16 target for Jetson" << endl;
 #endif
 #else
         net.setPreferableBackend(DNN_BACKEND_OPENCV);
         net.setPreferableTarget(DNN_TARGET_CPU);
 #ifdef DEBUG
-        cout << "Using OpenCV backend and CPU target." << endl;
+        cout << "Using CPU backend and target" << endl;
 #endif
-#endif
-        if (net.empty()) {
-#ifdef DEBUG
-            cerr << "Error: Neural network is empty after loading." << endl;
-#endif
-            throw runtime_error("Failed to load YOLOv7-tiny model");
-        }
-#ifdef DEBUG
-        cout << "Model loaded successfully." << endl;
 #endif
 
-        width = 416;  // Hardcoded for simplicity, adjust as needed
-        height = 416;
+        if (net.empty()) {
+            throw runtime_error("Failed to load YOLOv7-tiny model");
+        }
+
+        width = 320;
+        height = 320;
         channel = 3;
         initialized = true;
 #ifdef DEBUG
-        cout << "JetsonDetector initialized. Dimensions: " << width << "x" << height << "x" << channel << endl;
+        cout << "JetsonDetector initialized: " << width << "x" << height << endl;
 #endif
     }
 
     DetectionOutput runInference(const Mat& input) override {
-#ifdef DEBUG
-        cout << "Running inference on input: " << input.cols << "x" << input.rows << endl;
-#endif
-        Mat blob = blobFromImage(input, 1.0 / 255.0, Size(width, height), Scalar(0, 0, 0), true, false);
-#ifdef DEBUG
-        cout << "Blob created: " << blob.cols << "x" << blob.rows << "x" << blob.channels() << endl;
-#endif
-        net.setInput(blob);
-#ifdef DEBUG
-        cout << "Input set to network." << endl;
-#endif
-
-        vector<Mat> outs;
-        vector<String> outNames = net.getUnconnectedOutLayersNames();
-#ifdef DEBUG
-        cout << "Output layer names: ";
-        for (const auto& name : outNames) cout << name << " ";
-        cout << endl;
-#endif
-        net.forward(outs, outNames);
-#ifdef DEBUG
-        cout << "Inference completed. Number of outputs: " << outs.size() << endl;
-        for (size_t i = 0; i < outs.size(); i++) {
-            cout << "Output " << i << ": " << outs[i].cols << "x" << outs[i].rows << endl;
-        }
-#endif
-
         DetectionOutput output;
-        output.buffers.resize(outs.size());
-        output.num_outputs = outs.size();
-        for (size_t i = 0; i < outs.size(); i++) {
-            output.buffers[i] = outs[i].data;  // Note: This assumes float output
-#ifdef DEBUG
-            cout << "Output " << i << " buffer assigned, size=" << outs[i].total() * outs[i].elemSize() << " bytes" << endl;
-#endif
-        }
-        output.scales = vector<float>(outs.size(), 1.0);  // No quantization
-        output.zps = vector<int32_t>(outs.size(), 0);     // No quantization
-#ifdef DEBUG
-        cout << "DetectionOutput prepared: " << output.num_outputs << " outputs, scales and zps set." << endl;
-#endif
-
+        output.num_outputs = 0;
         return output;
     }
 
-    // Destructor (optional, added for completeness)
     ~JetsonDetector() override {
 #ifdef DEBUG
         cout << "Destroying JetsonDetector..." << endl;
 #endif
-        // Net is automatically cleaned up by OpenCV's destructor
     }
 };
+
+void JetsonDetector::preprocessFrame(const Mat& frame, Mat& blob) {
+    // Upload frame to GPU
+    cuda::GpuMat d_frame(frame);
+    cuda::GpuMat d_img, d_resized_img, d_resized_part;
+
+    // Convert to RGB on GPU
+    cuda::cvtColor(d_frame, d_img, COLOR_BGR2RGB);
+
+    // Resize with letterboxing on GPU
+    int img_width = d_img.cols;
+    int img_height = d_img.rows;
+    float scale = min(static_cast<float>(width) / img_width, static_cast<float>(height) / img_height);
+    int new_width = static_cast<int>(img_width * scale);
+    int new_height = static_cast<int>(img_height * scale);
+    int dx = (width - new_width) / 2;
+    int dy = (height - new_height) / 2;
+
+    d_resized_img = cuda::GpuMat(height, width, CV_8UC3, Scalar(114, 114, 114));
+    cuda::resize(d_img, d_resized_part, Size(new_width, new_height));
+    d_resized_part.copyTo(d_resized_img(Rect(dx, dy, new_width, new_height)));
+
+    // Download to CPU and create 4D blob
+    Mat resized_img;
+    d_resized_img.download(resized_img);
+    blob = blobFromImage(resized_img, 1.0 / 255.0, Size(width, height), Scalar(0, 0, 0), true, false);
+#ifdef DEBUG
+    cout << "Preprocessing completed, blob shape: " << blob.size[0] << "x" << blob.size[1] << "x" 
+         << blob.size[2] << "x" << blob.size[3] << endl;
+#endif
+}
+
+void JetsonDetector::runInferenceGPU(const Mat& blob, vector<Mat>& outs) {
+    net.setInput(blob);
+    vector<String> outNames = net.getUnconnectedOutLayersNames();
+    net.forward(outs, outNames);
+#ifdef DEBUG
+    cout << "Inference completed. Outputs: " << outs.size() << endl;
+#endif
+}
+
+void JetsonDetector::postprocessDetections(const vector<Mat>& outs, Mat& frame, float scale, int dx, int dy) {
+    int img_width = frame.cols;
+    int img_height = frame.rows;
+
+    vector<Rect> boxes;
+    vector<float> confidences;
+    vector<int> classIds;
+
+    for (size_t i = 0; i < outs.size(); ++i) {
+        float* data = (float*)outs[i].data;
+        int rows = outs[i].rows;
+        int cols = outs[i].cols;
+
+        for (int j = 0; j < rows; ++j) {
+            float confidence = data[j * cols + 4];
+            if (confidence > BOX_THRESH) {
+                Mat scores = outs[i].row(j).colRange(5, cols);
+                Point classIdPoint;
+                double maxScore;
+                minMaxLoc(scores, 0, &maxScore, 0, &classIdPoint);
+
+                float totalConfidence = confidence * maxScore;
+                if (totalConfidence > BOX_THRESH) {
+                    float centerX = data[j * cols + 0] * width;
+                    float centerY = data[j * cols + 1] * height;
+                    float w = data[j * cols + 2] * width;
+                    float h = data[j * cols + 3] * height;
+
+                    int left = (centerX - w / 2 - dx) / scale;
+                    int top = (centerY - h / 2 - dy) / scale;
+                    int boxWidth = w / scale;
+                    int boxHeight = h / scale;
+
+                    left = max(0, min(left, img_width - 1));
+                    top = max(0, min(top, img_height - 1));
+                    boxWidth = min(boxWidth, img_width - left);
+                    boxHeight = min(boxHeight, img_height - top);
+
+                    boxes.push_back(Rect(left, top, boxWidth, boxHeight));
+                    confidences.push_back(totalConfidence);
+                    classIds.push_back(classIdPoint.x);
+                }
+            }
+        }
+    }
+
+    vector<int> indices;
+    NMSBoxes(boxes, confidences, BOX_THRESH, NMS_THRESH, indices);
+
+    detections.clear();
+    for (size_t i = 0; i < indices.size(); ++i) {
+        int idx = indices[i];
+        int classId = classIds[idx];
+        string className = (classId >= 0 && classId < classNames.size()) ? classNames[classId] : "unknown";
+
+        if (!targetClasses.empty()) {
+            bool isTarget = false;
+            for (const auto& target : targetClasses) {
+                if (className == target) {
+                    isTarget = true;
+                    break;
+                }
+            }
+            if (!isTarget) continue;
+        }
+
+        Rect box = boxes[idx];
+        Detection det;
+        det.classId = className;
+        det.confidence = confidences[idx];
+        det.box = box;
+        detections.push_back(det);
+
+#ifndef BENCHMARK
+        rectangle(frame, box, Scalar(0, 255, 0), 2);
+        string label = format("%s: %.1f%%", className.c_str(), confidences[idx] * 100);
+        int baseLine;
+        Size labelSize = getTextSize(label, FONT_HERSHEY_SIMPLEX, 0.5, 1, &baseLine);
+        int y = max(box.y - labelSize.height - baseLine, 0);
+        rectangle(frame, Point(box.x, y), Point(box.x + labelSize.width, y + labelSize.height + baseLine),
+                  Scalar(255, 255, 255), FILLED);
+        putText(frame, label, Point(box.x, y + labelSize.height), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 0, 0), 1);
+#endif
+    }
+}
 
 #ifdef USE_CUDA
 Detector* createDetector(const string& modelPath, const vector<string>& targetClasses) {

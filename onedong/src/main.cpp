@@ -5,6 +5,7 @@
 #include <iostream>
 #include <chrono>
 #include <curl/curl.h>
+#include <cstring>  // Added for strcmp
 
 using namespace cv;
 using namespace std;
@@ -56,6 +57,13 @@ vector<string> loadClassNames(const string& filename) {
     return classNames;
 }
 
+void printUsage(const char* progName) {
+    cout << "Usage: " << progName << " [--video <video_file>] [--image <image_file>]" << endl;
+    cout << "  --video <file> : Process a video file" << endl;
+    cout << "  --image <file> : Process a single image" << endl;
+    cout << "  (No arguments defaults to webcam)" << endl;
+}
+
 int main(int argc, char** argv) {
     // Initialize curl
     curl_global_init(CURL_GLOBAL_ALL);
@@ -63,9 +71,38 @@ int main(int argc, char** argv) {
 
     string classFile = "../models/coco.names";
     string modelPath = "../models";
-   
+    string videoFile;
+    string imageFile;
+
+    // Parse command-line arguments
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--video") == 0 && i + 1 < argc) {
+            videoFile = argv[++i];
+        } else if (strcmp(argv[i], "--image") == 0 && i + 1 < argc) {
+            imageFile = argv[++i];
+        } else {
+            cerr << "Unknown argument: " << argv[i] << endl;
+            printUsage(argv[0]);
+            if (curlHandle) curl_easy_cleanup(curlHandle);
+            curl_global_cleanup();
+            return -1;
+        }
+    }
+
+    // Validate arguments
+    if (!videoFile.empty() && !imageFile.empty()) {
+        cerr << "Error: Cannot specify both --video and --image" << endl;
+        printUsage(argv[0]);
+        if (curlHandle) curl_easy_cleanup(curlHandle);
+        curl_global_cleanup();
+        return -1;
+    }
+
 #ifdef DEBUG
     cout << "Starting object detection and tracking program..." << endl;
+    if (!videoFile.empty()) cout << "Using video file: " << videoFile << endl;
+    else if (!imageFile.empty()) cout << "Using image file: " << imageFile << endl;
+    else cout << "Using webcam" << endl;
 #endif
 
     vector<string> allClassNames = loadClassNames(classFile);
@@ -103,69 +140,107 @@ int main(int argc, char** argv) {
 #endif
     
     Mat frame;
-    VideoCapture cap(0);
-    if (!cap.isOpened()) {
-        cerr << "Error: Could not open video capture device 0." << endl;
-        cerr << "Check permissions (e.g., 'sudo chmod 666 /dev/video0')." << endl;
-        if (curlHandle) curl_easy_cleanup(curlHandle);
-        curl_global_cleanup();
-        return -1;
+    VideoCapture cap;
+
+    // Open input source based on arguments
+    if (!videoFile.empty()) {
+        cap.open(videoFile);
+        if (!cap.isOpened()) {
+            cerr << "Error: Could not open video file: " << videoFile << endl;
+            if (curlHandle) curl_easy_cleanup(curlHandle);
+            curl_global_cleanup();
+            return -1;
+        }
+        cout << "Video file opened successfully. Resolution: " 
+             << cap.get(CAP_PROP_FRAME_WIDTH) << "x" << cap.get(CAP_PROP_FRAME_HEIGHT) << endl;
+    } else if (!imageFile.empty()) {
+        frame = imread(imageFile);
+        if (frame.empty()) {
+            cerr << "Error: Could not open image file: " << imageFile << endl;
+            if (curlHandle) curl_easy_cleanup(curlHandle);
+            curl_global_cleanup();
+            return -1;
+        }
+        cout << "Image file opened successfully. Resolution: " 
+             << frame.cols << "x" << frame.rows << endl;
+    } else {
+        cap.open(0);  // Default to webcam
+        if (!cap.isOpened()) {
+            cerr << "Error: Could not open video capture device 0." << endl;
+            cerr << "Check permissions (e.g., 'sudo chmod 666 /dev/video0')." << endl;
+            if (curlHandle) curl_easy_cleanup(curlHandle);
+            curl_global_cleanup();
+            return -1;
+        }
+        cap >> frame;
+        if (frame.empty()) {
+            cerr << "Error: Initial frame capture failed." << endl;
+            cap.release();
+            if (curlHandle) curl_easy_cleanup(curlHandle);
+            curl_global_cleanup();
+            return -1;
+        }
+        cout << "Camera opened successfully. Resolution: " 
+             << frame.cols << "x" << frame.rows << endl;
     }
-    
-    cap >> frame;
-    if (frame.empty()) {
-        cerr << "Error: Initial frame capture failed." << endl;
-        cap.release();
-        if (curlHandle) curl_easy_cleanup(curlHandle);
-        curl_global_cleanup();
-        return -1;
-    }
-    
-    cout << "Camera opened successfully. Resolution: " 
-         << frame.cols << "x" << frame.rows << endl;
 
     const int fpsBufferSize = 16;
     float fpsBuffer[fpsBufferSize] = {0.0};
     int frameCount = 0;
     chrono::steady_clock::time_point startTime;
-    
-    while (true) {
+
+    // Main processing loop
+    if (!imageFile.empty()) {
+        // Single image processing
         startTime = chrono::steady_clock::now();
-        
-        cap >> frame;
-        if (frame.empty()) {
-            cerr << "Error: Frame capture failed during loop." << endl;
-            break;
-        }
-        
-        // Run detection
+
         detector->detect(frame);
-        
-        // Update tracker with new detections
         tracker.update(detector->getDetections(), frame.rows);
-        
-        // Draw tracking information
         tracker.draw(frame);
-        
-        // Calculate and display FPS
+
         auto endTime = chrono::steady_clock::now();
         float frameTimeMs = chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count();
         float fps = (frameTimeMs > 0) ? 1000.0f / frameTimeMs : 0.0f;
-        
-        fpsBuffer[frameCount % fpsBufferSize] = fps;
-        frameCount++;
-        
-        float avgFps = 0.0;
-        for (int i = 0; i < min(frameCount, fpsBufferSize); i++) {
-            avgFps += fpsBuffer[i];
-        }
-        avgFps /= min(frameCount, fpsBufferSize);
-        
-        string fpsText = format("FPS: %.2f", avgFps);
+        string fpsText = format("FPS: %.2f", fps);
         putText(frame, fpsText, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
-        
+
         imshow("People Detection and Tracking", frame);
-        if (waitKey(1) == 'q') break;
+        imwrite("output.jpg", frame);  // Save processed image
+        waitKey(0);  // Wait for any key press
+    } else {
+        // Video or webcam processing
+        while (true) {
+            startTime = chrono::steady_clock::now();
+            
+            cap >> frame;
+            if (frame.empty()) {
+                cerr << "Error: Frame capture failed during loop." << endl;
+                break;
+            }
+            
+            detector->detect(frame);
+            tracker.update(detector->getDetections(), frame.rows);
+            tracker.draw(frame);
+            
+            auto endTime = chrono::steady_clock::now();
+            float frameTimeMs = chrono::duration_cast<chrono::milliseconds>(endTime - startTime).count();
+            float fps = (frameTimeMs > 0) ? 1000.0f / frameTimeMs : 0.0f;
+            
+            fpsBuffer[frameCount % fpsBufferSize] = fps;
+            frameCount++;
+            
+            float avgFps = 0.0;
+            for (int i = 0; i < min(frameCount, fpsBufferSize); i++) {
+                avgFps += fpsBuffer[i];
+            }
+            avgFps /= min(frameCount, fpsBufferSize);
+            
+            string fpsText = format("FPS: %.2f", avgFps);
+            putText(frame, fpsText, Point(10, 30), FONT_HERSHEY_SIMPLEX, 0.7, Scalar(0, 255, 0), 2);
+            
+            imshow("People Detection and Tracking", frame);
+            if (waitKey(1) == 'q') break;
+        }
     }
     
     cap.release();

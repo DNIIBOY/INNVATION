@@ -155,13 +155,6 @@ void PeopleTracker::draw(Mat& frame) {
     // Draw entry/exit zones
     int topZoneY = frame.rows * topThreshold;
     int bottomZoneY = frame.rows * bottomThreshold;
-    
-    line(frame, Point(0, topZoneY), Point(frame.cols, topZoneY), Scalar(0, 255, 255), 1);
-    line(frame, Point(0, bottomZoneY), Point(frame.cols, bottomZoneY), Scalar(0, 255, 255), 1);
-    
-    // Add labels for zones
-    putText(frame, "Entry zone", Point(10, topZoneY - 10), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 1);
-    putText(frame, "Exit zone", Point(10, bottomZoneY + 20), FONT_HERSHEY_SIMPLEX, 0.5, Scalar(0, 255, 255), 1);
 }
 
 const vector<TrackedPerson>& PeopleTracker::getTrackedPeople() const {
